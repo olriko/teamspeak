@@ -1,0 +1,31 @@
+{
+    "$schema": "node_modules/wrangler/config-schema.json",
+    "name": "teamspeak",
+    "main": "src/index.ts",
+    "compatibility_date": "2025-04-01",
+    "containers": [
+        {
+            "class_name": "TeamSpeakContainer",
+            "image": "./Dockerfile",
+            "max_instances": 1,
+            "instance_type": "basic"
+        }
+    ],
+    "durable_objects": {
+        "bindings": [
+            {
+                "name": "TEAMSPEAK_CONTAINER",
+                "class_name": "TeamSpeakContainer"
+            }
+        ]
+    },
+    "migrations": [
+        {
+            "tag": "v1",
+            "new_sqlite_classes": ["TeamSpeakContainer"]
+        }
+    ],
+    "observability": {
+        "enabled": true
+    }
+}
