@@ -1,0 +1,190 @@
+name: 'Deploy'
+
+env:
+  DIGITALOCEAN_DROPLET_NAME: teamspeak
+  DIGITALOCEAN_VOLUME_NAME: database
+  DIGITALOCEAN_SSH_KEY_NAME: teamspeak-ci
+  DIGITALOCEAN_DROPLET_SIZE: s-1vcpu-1gb
+  DIGITALOCEAN_REGION: ams3
+  DIGITALOCEAN_VOLUME_SIZE: 3GiB
+
+on:
+  workflow_dispatch:
+    inputs:
+      droplet-name:
+        description: 'Droplet name teamspeak'
+        required: true
+        default: "teamspeak"
+
+jobs:
+  generate-keys:
+    name: Generate keys
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install doctl
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+
+      - name: Keygen
+        id: keys
+        run: |
+            ssh-keygen -t rsa -N "" -f ~/.ssh/id_rsa
+            export SSH_KEY="$(cat ~/.ssh/id_rsa)"
+            SSH_KEY="${SSH_KEY//'%'/'%25'}"
+            SSH_KEY="${SSH_KEY//$'\n'/'%0A'}"
+            SSH_KEY="${SSH_KEY//$'\r'/'%0D'}"
+            echo "::set-output name=private::$(echo "$SSH_KEY")"
+            echo "::set-output name=public::$(cat ~/.ssh/id_rsa.pub)"
+
+      - name: Upload ssh key
+        id: upload
+        run: |
+          echo "::set-output name=id::$(doctl compute ssh-key create --format ID,Name --public-key "${{ steps.keys.outputs.public }}" "${{ env.DIGITALOCEAN_SSH_KEY_NAME }}" | grep "${{ env.DIGITALOCEAN_SSH_KEY_NAME }}" | cut -d ' ' -f1)"
+
+
+    outputs:
+      private-key: ${{ steps.keys.outputs.private }}
+      public-key: ${{ steps.keys.outputs.public }}
+      id: ${{ steps.upload.outputs.id }}
+
+  hydrate-droplet:
+    name: Hydrate droplet
+    runs-on: ubuntu-latest
+    needs:
+      - generate-keys
+    steps:
+      - name: Install doctl
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+
+      - name: Check droplet
+        id: check-droplet
+        run: echo "::set-output name=value::$(doctl compute droplet list --region "${{ env.DIGITALOCEAN_REGION }}" | grep ${{ github.event.inputs.droplet-name }} | wc -l)"
+
+      - name: Abort if droplet name already exists
+        if: ${{ steps.check-droplet.outputs.value != 0 }}
+        run: exit 1
+
+      - name: Create droplet
+        id: create-droplet
+        if: ${{ steps.check-droplet.outputs.value == 0 }}
+        run: |
+          doctl compute droplet create \
+          --image "docker-20-04" \
+          --size "${{ env.DIGITALOCEAN_DROPLET_SIZE }}" \
+          --enable-monitoring \
+          --wait \
+          --ssh-keys "${{ needs.generate-keys.outputs.id }}" \
+          --output "json" \
+          --region "${{ env.DIGITALOCEAN_REGION }}" "${{ github.event.inputs.droplet-name }}"
+
+  hydrate-volume:
+    name: Hydrate volume
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install doctl
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+
+      - name: Check volume
+        id: check-volume
+        run:  echo "::set-output name=value::$(doctl compute volume list --region "${{ env.DIGITALOCEAN_REGION }}" | grep "${{ env.DIGITALOCEAN_VOLUME_NAME }}" | wc -l)"
+
+      - name: Abort if volume name already exists
+        if: ${{ steps.check-volume.outputs.value != 0 }}
+        run: echo "${{ steps.check-volume.outputs.value }}" & exit 1
+
+      - name: Create volume
+        if: ${{ steps.check-volume.outputs.value == 0 }}
+        run: |
+          doctl compute volume create \
+          --size "${{ env.DIGITALOCEAN_VOLUME_SIZE }}" \
+          --region "${{ env.DIGITALOCEAN_REGION }}" "${{ env.DIGITALOCEAN_VOLUME_NAME }}"
+
+  attach:
+    name: Attach volume
+    runs-on: ubuntu-latest
+    needs:
+      - hydrate-droplet
+      - hydrate-volume
+      - generate-keys
+    steps:
+      - name: Install doctl
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+
+      - name: Get volume id
+        id: get-volume
+        run: echo "::set-output name=id::$(doctl compute volume ls --format ID,Name | grep ${{ env.DIGITALOCEAN_VOLUME_NAME }} | cut -d ' ' -f1)"
+
+      - name: Get droplet id
+        id: get-droplet
+        run: |
+          echo "::set-output name=id::$(doctl compute droplet get --template "{{.ID}}" ${{ github.event.inputs.droplet-name }})"
+          echo "::set-output name=ip::$(doctl compute droplet get --template "{{.PublicIPv4}}" ${{ github.event.inputs.droplet-name }})"
+
+      - name: Attach
+        if: ${{ success() }}
+        continue-on-error: true
+        run: doctl compute volume-action attach --wait ${{ steps.get-volume.outputs.id }} ${{ steps.get-droplet.outputs.id }}
+
+    outputs:
+      droplet-id: ${{ steps.get-droplet.outputs.id }}
+      droplet-ip: ${{ steps.get-droplet.outputs.ip }}
+
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    needs:
+      - attach
+      - generate-keys
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+
+      - name: Create private and public ssh key file
+        run: |
+          mkdir ~/.ssh
+          echo "${{ needs.generate-keys.outputs.private-key }}" > ~/.ssh/id_rsa
+          echo "${{ needs.generate-keys.outputs.public-key }}" > ~/.ssh/id_rsa.pub
+          touch ~/.ssh/known_hosts
+          chmod 400 ~/.ssh/id_rsa
+          chmod 400 ~/.ssh/known_hosts
+
+      - name: Install doctl
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+
+      - name: Copy docker compose
+        run: scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ./docker-compose.yml root@${{ needs.attach.outputs.droplet-ip }}:./docker-compose.yml
+
+      - name: Mount volume
+        uses: garygrossgarten/github-action-ssh@release
+        with:
+          username: root
+          host: ${{ needs.attach.outputs.droplet-ip }}
+          privateKey: ${{ needs.generate-keys.outputs.private-key }}
+          command: |
+            sudo mkfs.ext4 /dev/disk/by-id/scsi-0DO_Volume_${{ env.DIGITALOCEAN_VOLUME_NAME }}
+            mkdir -p /mnt/${{ env.DIGITALOCEAN_VOLUME_NAME }}
+            mount -o discard,defaults,noatime /dev/disk/by-id/scsi-0DO_Volume_${{ env.DIGITALOCEAN_VOLUME_NAME }} /mnt/${{ env.DIGITALOCEAN_VOLUME_NAME }}
+            echo '/dev/disk/by-id/scsi-0DO_Volume_${{ env.DIGITALOCEAN_VOLUME_NAME }} /mnt/${{ env.DIGITALOCEAN_VOLUME_NAME }} ext4 defaults,nofail,discard 0 0' | sudo tee -a /etc/fstab
+            exit
+
+      - name: SSH
+        uses: garygrossgarten/github-action-ssh@release
+        with:
+          username: root
+          host: ${{ needs.attach.outputs.droplet-ip }}
+          privateKey: ${{ needs.generate-keys.outputs.private-key }}
+          command: |
+            export VOLUME=/mnt/${{ env.DIGITALOCEAN_VOLUME_NAME }}
+            export TS3SERVER_DB_PASSWORD=${{ secrets.TS3SERVER_DB_PASSWORD }}
+            docker-compose config
+            docker-compose up -d
+            exit
