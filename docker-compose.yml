@@ -5,8 +5,10 @@ services:
     depends_on:
       - db
     restart: always
+    volumes:
+      - ./licensekey.dat:/var/ts3server/licensekey.dat
     ports:
-      - 9987:9987/udp
+      - 9900-9999:9900-9999/udp
       - 10011:10011
       - 30033:30033
     environment:

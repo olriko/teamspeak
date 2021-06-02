@@ -1,0 +1,83 @@
+name: 'Reboot'
+
+on:
+  workflow_dispatch:
+    inputs:
+      droplet-name:
+        description: 'Droplet name teamspeak'
+        required: true
+        default: "teamspeak"
+      droplet-volume:
+        description: 'Droplet volume database'
+        required: true
+        default: "database"
+
+jobs:
+  droplet:
+    name: Get droplet
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install doctl
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+
+      - name: Check droplet
+        id: check-droplet
+        run: echo "::set-output name=value::$(doctl compute droplet list --region "${{ env.DIGITALOCEAN_REGION }}" | grep ${{ github.event.inputs.droplet-name }} | wc -l)"
+
+      - name: Abort if droplet doesn't exists
+        if: ${{ steps.check-droplet.outputs.value == 0 }}
+        run: exit 1
+
+      - name: Get droplet id
+        id: get-droplet
+        run: |
+          echo "::set-output name=id::$(doctl compute droplet get --template "{{.ID}}" ${{ github.event.inputs.droplet-name }})"
+          echo "::set-output name=ip::$(doctl compute droplet get --template "{{.PublicIPv4}}" ${{ github.event.inputs.droplet-name }})"
+
+    outputs:
+      id: ${{ steps.get-droplet.outputs.id }}
+      ip: ${{ steps.get-droplet.outputs.ip }}
+
+  update:
+    name: Update files
+    runs-on: ubuntu-latest
+    needs:
+      - droplet
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+
+      - name: Create private and public ssh key file
+        run: |
+          mkdir ~/.ssh
+          echo "${{ secrets.PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          echo "${{ secrets.PUBLIC_KEY }}" > ~/.ssh/id_rsa.pub
+          touch ~/.ssh/known_hosts
+          chmod 400 ~/.ssh/id_rsa
+          chmod 400 ~/.ssh/known_hosts
+
+      - name: Copy docker compose and run script
+        run: |
+          scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ./docker-compose.yml root@${{ needs.droplet.outputs.ip }}:./docker-compose.yml
+          sed -i '1 a export VOLUME=/mnt/${{ github.event.inputs.droplet-volume }}' ./run.sh
+          sed -i '1 a export TS3SERVER_DB_PASSWORD=${{ secrets.TS3SERVER_DB_PASSWORD }}' ./run.sh
+          scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ./run.sh root@${{ needs.droplet.outputs.ip }}:/etc/init.d/run-teamspeak
+
+  restart:
+    name: Restart droplet
+    runs-on: ubuntu-latest
+    needs:
+      - update
+      - droplet
+    steps:
+      - name: Install doctl
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+
+      - name: Reboot
+        if: ${{ success() }}
+        run: |
+          doctl compute droplet-action reboot --wait ${{ needs.droplet.outputs.id }}

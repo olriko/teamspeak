@@ -1,12 +1,10 @@
 name: 'Deploy'
 
 env:
-  DIGITALOCEAN_DROPLET_NAME: teamspeak
-  DIGITALOCEAN_VOLUME_NAME: database
-  DIGITALOCEAN_SSH_KEY_NAME: teamspeak-ci
   DIGITALOCEAN_DROPLET_SIZE: s-1vcpu-1gb
+  DIGITALOCEAN_SSH_KEY_NAME: ci-teamspeak
   DIGITALOCEAN_REGION: ams3
-  DIGITALOCEAN_VOLUME_SIZE: 3GiB
+  DIGITALOCEAN_VOLUME_SIZE: 5GiB
 
 on:
   workflow_dispatch:
@@ -15,6 +13,11 @@ on:
         description: 'Droplet name teamspeak'
         required: true
         default: "teamspeak"
+
+      droplet-volume:
+        description: 'Droplet volume database'
+        required: true
+        default: "database"
 
 jobs:
   generate-keys:
@@ -26,27 +29,19 @@ jobs:
         with:
           token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
 
-      - name: Keygen
-        id: keys
+      - name: SSH KEY
+        id: ssh
         run: |
-            ssh-keygen -t rsa -N "" -f ~/.ssh/id_rsa
-            export SSH_KEY="$(cat ~/.ssh/id_rsa)"
-            SSH_KEY="${SSH_KEY//'%'/'%25'}"
-            SSH_KEY="${SSH_KEY//$'\n'/'%0A'}"
-            SSH_KEY="${SSH_KEY//$'\r'/'%0D'}"
-            echo "::set-output name=private::$(echo "$SSH_KEY")"
-            echo "::set-output name=public::$(cat ~/.ssh/id_rsa.pub)"
-
-      - name: Upload ssh key
-        id: upload
-        run: |
-          echo "::set-output name=id::$(doctl compute ssh-key create --format ID,Name --public-key "${{ steps.keys.outputs.public }}" "${{ env.DIGITALOCEAN_SSH_KEY_NAME }}" | grep "${{ env.DIGITALOCEAN_SSH_KEY_NAME }}" | cut -d ' ' -f1)"
-
+          ID=$(doctl compute ssh-key list --format ID,Name | grep "${{ env.DIGITALOCEAN_SSH_KEY_NAME }}" | cut -d ' ' -f1)
+          if [ -z "$ID" ]
+          then
+            echo "::set-output name=id::$(doctl compute ssh-key create --format ID,Name --public-key "${{ secrets.PUBLIC_KEY }}" "${{ env.DIGITALOCEAN_SSH_KEY_NAME }}" | grep "${{ env.DIGITALOCEAN_SSH_KEY_NAME }}" | cut -d ' ' -f1)"
+          else
+            echo "::set-output name=id::$(echo "$ID")"
+          fi
 
     outputs:
-      private-key: ${{ steps.keys.outputs.private }}
-      public-key: ${{ steps.keys.outputs.public }}
-      id: ${{ steps.upload.outputs.id }}
+      id: ${{ steps.ssh.outputs.id }}
 
   hydrate-droplet:
     name: Hydrate droplet
@@ -91,7 +86,7 @@ jobs:
 
       - name: Check volume
         id: check-volume
-        run:  echo "::set-output name=value::$(doctl compute volume list --region "${{ env.DIGITALOCEAN_REGION }}" | grep "${{ env.DIGITALOCEAN_VOLUME_NAME }}" | wc -l)"
+        run:  echo "::set-output name=value::$(doctl compute volume list --region "${{ env.DIGITALOCEAN_REGION }}" | grep "${{ github.event.inputs.droplet-volume }}" | wc -l)"
 
       - name: Abort if volume name already exists
         if: ${{ steps.check-volume.outputs.value != 0 }}
@@ -102,7 +97,7 @@ jobs:
         run: |
           doctl compute volume create \
           --size "${{ env.DIGITALOCEAN_VOLUME_SIZE }}" \
-          --region "${{ env.DIGITALOCEAN_REGION }}" "${{ env.DIGITALOCEAN_VOLUME_NAME }}"
+          --region "${{ env.DIGITALOCEAN_REGION }}" "${{ github.event.inputs.droplet-volume }}"
 
   attach:
     name: Attach volume
@@ -119,7 +114,7 @@ jobs:
 
       - name: Get volume id
         id: get-volume
-        run: echo "::set-output name=id::$(doctl compute volume ls --format ID,Name | grep ${{ env.DIGITALOCEAN_VOLUME_NAME }} | cut -d ' ' -f1)"
+        run: echo "::set-output name=id::$(doctl compute volume ls --format ID,Name | grep "${{ github.event.inputs.droplet-volume }}" | cut -d ' ' -f1)"
 
       - name: Get droplet id
         id: get-droplet
@@ -149,8 +144,8 @@ jobs:
       - name: Create private and public ssh key file
         run: |
           mkdir ~/.ssh
-          echo "${{ needs.generate-keys.outputs.private-key }}" > ~/.ssh/id_rsa
-          echo "${{ needs.generate-keys.outputs.public-key }}" > ~/.ssh/id_rsa.pub
+          echo "${{ secrets.PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          echo "${{ secrets.PUBLIC_KEY }}" > ~/.ssh/id_rsa.pub
           touch ~/.ssh/known_hosts
           chmod 400 ~/.ssh/id_rsa
           chmod 400 ~/.ssh/known_hosts
@@ -160,31 +155,42 @@ jobs:
         with:
           token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
 
-      - name: Copy docker compose
-        run: scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ./docker-compose.yml root@${{ needs.attach.outputs.droplet-ip }}:./docker-compose.yml
+      - name: Copy docker compose and start script
+        run: |
+          scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ./docker-compose.yml root@${{ needs.attach.outputs.droplet-ip }}:./docker-compose.yml
+          sed -i '1 a export VOLUME=/mnt/${{ github.event.inputs.droplet-volume }}' ./run.sh
+          sed -i '1 a export TS3SERVER_DB_PASSWORD=${{ secrets.TS3SERVER_DB_PASSWORD }}' ./run.sh
+          scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ./run.sh root@${{ needs.attach.outputs.droplet-ip }}:/etc/init.d/run-teamspeak
+
+      - name: Copy licence key
+        shell: bash
+        run: |
+          [ -z "${{ secrets.TS3SERVER_LICENSEKEY }}" ] && echo "No licence key" || echo "${{ secrets.TS3SERVER_LICENSEKEY }}" > licensekey.dat
+          [ -f "./licensekey.dat" ] && scp -r -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ./licensekey.dat root@${{ needs.attach.outputs.droplet-ip }}:./licensekey.dat
 
       - name: Mount volume
         uses: garygrossgarten/github-action-ssh@release
         with:
           username: root
           host: ${{ needs.attach.outputs.droplet-ip }}
-          privateKey: ${{ needs.generate-keys.outputs.private-key }}
+          privateKey: ${{ secrets.PRIVATE_KEY }}
           command: |
-            sudo mkfs.ext4 /dev/disk/by-id/scsi-0DO_Volume_${{ env.DIGITALOCEAN_VOLUME_NAME }}
-            mkdir -p /mnt/${{ env.DIGITALOCEAN_VOLUME_NAME }}
-            mount -o discard,defaults,noatime /dev/disk/by-id/scsi-0DO_Volume_${{ env.DIGITALOCEAN_VOLUME_NAME }} /mnt/${{ env.DIGITALOCEAN_VOLUME_NAME }}
-            echo '/dev/disk/by-id/scsi-0DO_Volume_${{ env.DIGITALOCEAN_VOLUME_NAME }} /mnt/${{ env.DIGITALOCEAN_VOLUME_NAME }} ext4 defaults,nofail,discard 0 0' | sudo tee -a /etc/fstab
+            sudo mkfs.ext4 /dev/disk/by-id/scsi-0DO_Volume_${{ github.event.inputs.droplet-volume }}
+            mkdir -p /mnt/${{ github.event.inputs.droplet-volume }}
+            mount -o discard,defaults,noatime /dev/disk/by-id/scsi-0DO_Volume_${{ github.event.inputs.droplet-volume }} /mnt/${{ github.event.inputs.droplet-volume }}
+            echo '/dev/disk/by-id/scsi-0DO_Volume_${{ github.event.inputs.droplet-volume }} /mnt/${{ github.event.inputs.droplet-volume }} ext4 defaults,nofail,discard 0 0' | sudo tee -a /etc/fstab
             exit
 
-      - name: SSH
+      - name: Docker
         uses: garygrossgarten/github-action-ssh@release
         with:
           username: root
           host: ${{ needs.attach.outputs.droplet-ip }}
-          privateKey: ${{ needs.generate-keys.outputs.private-key }}
+          privateKey: ${{ secrets.PRIVATE_KEY }}
           command: |
-            export VOLUME=/mnt/${{ env.DIGITALOCEAN_VOLUME_NAME }}
+            export VOLUME=/mnt/${{ github.event.inputs.droplet-volume }}
             export TS3SERVER_DB_PASSWORD=${{ secrets.TS3SERVER_DB_PASSWORD }}
             docker-compose config
             docker-compose up -d
+            sleep 60 && docker-compose logs
             exit
