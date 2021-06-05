@@ -194,3 +194,6 @@ jobs:
             docker-compose up -d
             sleep 60 && docker-compose logs
             exit
+
+      - name: Your server IP
+        run: echo "${{ needs.attach.outputs.droplet-ip }}"
