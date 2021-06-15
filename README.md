@@ -5,7 +5,7 @@
 A project to deploy and manage easily your teamspeak server with **DigitalOcean** and **Github CI** Workflow.
 By default, it runs a free teamspeak license which means that it's a 32 user's slots server with the smallest DigitalOcean VPS which costs only **5 dollars** per month.
 
-> Even if you are not friendly with github, it's really easy to create a Teamspeak server. You can watch out this youtube guide.
+> Even if you are not friendly with github, it's really easy to create a Teamspeak server. You can watch out this [youtube guide (french)](https://www.youtube.com/watch?v=SB1nXV665uI).
 
 # Get started
 
